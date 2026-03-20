@@ -550,14 +550,17 @@ class Matcher:
 
                 if next_char == '<':
                     # ════════════════════════════════════════════════
-                    # CASE A: Literal quote  <<some text>>
+                    # CASE A: Angle-bracket literal  <<X>>  →  <X>
                     # ════════════════════════════════════════════════
                     #
-                    # We've seen '<<'. Now read everything up to '>>'
-                    # and treat each character as a plain LiteralPattern.
+                    # We've seen '<<'. Read everything up to '>>' as
+                    # content X, then emit literals for the text <X>.
                     #
-                    # The content starts right after the opening '<<',
-                    # so at position i+2.
+                    # The < and > are ALWAYS added automatically:
+                    #   <<int>>  →  matches "<int>"  (not a digit token)
+                    #   <<a-z>>  →  matches "<a-z>"  (not a range token)
+                    #   <<a:z>>  →  matches "<a:z>"  (arbitrary content)
+                    #   <<>>     →  matches "<>"      (empty content)
 
                     # Find the closing '>>'
                     # We search for '>>' starting from i+2 (after the '<<')
@@ -570,14 +573,26 @@ class Matcher:
                         )
 
                     # Extract the raw text between << and >>
-                    # e.g. "<<hello>>" → quoted_text = "hello"
-                    # e.g. "<<<>>"     → quoted_text = "<"
-                    # e.g. "<<>>"      → quoted_text = ""  (empty — no-op)
+                    # e.g. "<<int>>"  → quoted_text = "int"
+                    # e.g. "<<a-z>>"  → quoted_text = "a-z"
+                    # e.g. "<<>>"     → quoted_text = ""
                     quoted_text: str = pattern_str[i + 2 : closing_quote]
 
-                    # Turn each character in the quoted text into a LiteralPattern
+                    # <<X>> matches the LITERAL TEXT <X>
+                    # i.e. the < and > are automatically added around the content.
+                    #
+                    # So we always emit:
+                    #   Literal('<')  +  one Literal per char in content  +  Literal('>')
+                    #
+                    # Examples:
+                    #   <<int>>  → '<', 'i', 'n', 't', '>'  →  matches "<int>"
+                    #   <<a-z>>  → '<', 'a', '-', 'z', '>'  →  matches "<a-z>"
+                    #   <<a:z>>  → '<', 'a', ':', 'z', '>'  →  matches "<a:z>"
+                    #   <<>>     → '<', '>'                  →  matches "<>"
+                    patterns.append(LiteralPattern('<'))
                     for ch in quoted_text:
                         patterns.append(LiteralPattern(ch))
+                    patterns.append(LiteralPattern('>'))
 
                     # Jump past the entire <<...>> block
                     # closing_quote points to the first '>' of '>>'
@@ -621,14 +636,28 @@ class Matcher:
         """
         Parse the content inside < > and return the right Pattern object.
 
-        This method handles all three token forms:
-            - Character groups: "[abc]", "[a-z]", "[a-z]*3"
-            - Wildcard:         "_", "_*5"
-            - Named tokens:     "int", "alpha", "int*3", "word*2"
+        This method handles three token forms:
+
+            Case 1 — Range token:  e.g. <a-z>, <A-Z*3>, <0-9*2>
+                Detected by: exactly one '-' with a single char on each side,
+                             before any '*' multiplier.
+                Syntax:  <START-END>  or  <START-END*N>
+                Example: <a-z>   → CharGroupPattern("a-z")
+                         <a-z*3> → RepeatPattern(CharGroupPattern("a-z"), 3)
+
+            Case 2 — Wildcard:  e.g. <_>, <_*5>
+                Detected by: token starts with '_'
+                Example: <_>   → AnyPattern()
+                         <_*5> → RepeatPattern(AnyPattern(), 5)
+
+            Case 3 — Named token:  e.g. <int>, <alpha*3>, <word*2>
+                Detected by: everything else — look up in TOKEN_REGISTRY
+                Example: <int>    → IntPattern()
+                         <int*3>  → RepeatPattern(IntPattern(), 3)
 
         Args:
             token_content (str): Everything between < and >.
-                                 e.g. "int*3", "[a-z]*2", "_", "alpha"
+                                 e.g. "a-z", "a-z*3", "int*3", "_", "alpha"
 
         Returns:
             Pattern: The appropriate Pattern object, possibly wrapped
@@ -638,40 +667,53 @@ class Matcher:
             ValueError: For unknown token names or bad multiplier values.
         """
 
-        # ── CASE 1: Character group  e.g. [abc] or [a-z]*3 ──
-        if token_content.startswith('['):
+        # ── CASE 1: Range token  e.g. a-z  or  a-z*3  or  0-9*2 ──
+        #
+        # Detection rule:
+        #   Split off any *N multiplier first, then check if what remains
+        #   looks like "X-Y" — exactly one char, a dash, exactly one char.
+        #
+        # Examples:
+        #   "a-z"    → base="a-z",   multiplier=""   → range ✅
+        #   "a-z*3"  → base="a-z",   multiplier="*3" → range ✅
+        #   "int"    → base="int",   multiplier=""   → not a range ❌
+        #   "int*3"  → base="int*3", no '-' at pos 1 → not a range ❌
 
-            # Find the closing ']'
-            bracket_close: int = token_content.find(']')
-            if bracket_close == -1:
-                raise ValueError(
-                    f"Unclosed '[' inside token '<{token_content}>'. "
-                    f"Did you forget to close with ']'?"
-                )
+        # Split on '*' to isolate the base name from any multiplier
+        # e.g. "a-z*3" → parts = ["a-z", "3"]
+        # e.g. "a-z"   → parts = ["a-z"]
+        parts: list[str] = token_content.split('*', maxsplit=1)
 
-            # Extract what's inside the brackets — the group definition
-            # e.g. "[a-z]*3" → group_str = "a-z"
-            group_str: str = token_content[1 : bracket_close]
+        # The base is everything before the first '*'
+        base: str = parts[0]
 
-            # Check if there's a *N multiplier after the ']'
-            # e.g. "[a-z]*3" → after_bracket = "*3"
-            after_bracket: str = token_content[bracket_close + 1 :]
+        # A range looks like exactly: one char, '-', one char  → length 3
+        # and the middle character must be '-'
+        is_range: bool = (
+            len(base) == 3 and   # must be exactly "X-Y"
+            base[1] == '-'       # middle character must be a dash
+        )
 
-            # Parse the multiplier (returns 1 if no multiplier present)
-            count: int = self._parse_multiplier(after_bracket, token_content)
+        if is_range:
+            # Extract the range start and end characters
+            range_str: str = base  # e.g. "a-z"
 
-            # Build the character group pattern
-            base_pattern: Pattern = CharGroupPattern(group_str)
+            # Extract the multiplier string (e.g. "*3" or "" if none)
+            multiplier_str: str = f"*{parts[1]}" if len(parts) == 2 else ""
+            count: int = self._parse_multiplier(multiplier_str, token_content)
 
-            # Wrap in RepeatPattern if count > 1, otherwise use as-is
+            # Build a CharGroupPattern from the range string "X-Y"
+            # CharGroupPattern already knows how to expand "a-z" into a full set
+            base_pattern: Pattern = CharGroupPattern(range_str)
+
+            # Wrap in RepeatPattern if count > 1
             return RepeatPattern(base_pattern, count) if count > 1 else base_pattern
 
-        # ── CASE 2: Wildcard  e.g. _ or _*5 ──
+        # ── CASE 2: Wildcard  e.g. _  or  _*5 ──
         elif token_content.startswith('_'):
 
             # Everything after '_' should be empty or a *N multiplier
             after_underscore: str = token_content[1:]
-
             count = self._parse_multiplier(after_underscore, token_content)
 
             base_pattern = AnyPattern()
@@ -680,27 +722,23 @@ class Matcher:
         # ── CASE 3: Named token  e.g. int, alpha, int*3, word*2 ──
         else:
 
-            # Split on '*' to separate name from optional multiplier
-            # e.g. "int*3"  → parts = ["int", "3"]
-            # e.g. "alpha"  → parts = ["alpha"]
-            parts: list[str] = token_content.split('*')
-
-            # The token name is always the first part
-            token_name: str = parts[0]
+            # The token name is the base (already split above)
+            token_name: str = base
 
             # Parse the multiplier from the second part (if present)
-            multiplier_str: str = f"*{parts[1]}" if len(parts) == 2 else ""
+            multiplier_str = f"*{parts[1]}" if len(parts) == 2 else ""
             count = self._parse_multiplier(multiplier_str, token_content)
 
-            # Validate: is this a known token?
+            # Validate: is this a known token name?
             if token_name not in TOKEN_REGISTRY:
                 raise ValueError(
                     f"Unknown token '<{token_name}>'. "
                     f"Available tokens: {list(TOKEN_REGISTRY.keys())} "
-                    f"plus <_> and <[...]>."
+                    f"plus <_>, <START-END> ranges e.g. <a-z>, "
+                    f"and <<...>> for literals."
                 )
 
-            # Instantiate the correct Pattern class
+            # Instantiate the correct Pattern class from the registry
             base_pattern = TOKEN_REGISTRY[token_name]()
 
             # Wrap in RepeatPattern if count > 1

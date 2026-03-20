@@ -333,18 +333,24 @@ class TestMatcherParse:
         assert isinstance(p.inner, AnyPattern)
         assert p.count == 5
 
-    def test_parses_char_group(self) -> None:
-        assert isinstance(Matcher("<[abc]>").patterns[0], CharGroupPattern)
-
-    def test_parses_char_group_range_expands_correctly(self) -> None:
-        p = Matcher("<[a-z]>").patterns[0]
+    def test_parses_range_token(self) -> None:
+        """<a-z> should produce a CharGroupPattern."""
+        p = Matcher("<a-z>").patterns[0]
         assert isinstance(p, CharGroupPattern)
         assert 'a' in p.allowed_chars
         assert 'z' in p.allowed_chars
         assert 'A' not in p.allowed_chars
 
-    def test_parses_char_group_with_multiplier(self) -> None:
-        p = Matcher("<[a-z]*3>").patterns[0]
+    def test_parses_range_token_digits(self) -> None:
+        """<0-9> should produce a CharGroupPattern covering digits."""
+        p = Matcher("<0-9>").patterns[0]
+        assert isinstance(p, CharGroupPattern)
+        assert '5' in p.allowed_chars
+        assert 'a' not in p.allowed_chars
+
+    def test_parses_range_with_multiplier(self) -> None:
+        """<a-z*3> should produce RepeatPattern wrapping CharGroupPattern."""
+        p = Matcher("<a-z*3>").patterns[0]
         assert isinstance(p, RepeatPattern)
         assert isinstance(p.inner, CharGroupPattern)
         assert p.count == 3
@@ -362,10 +368,6 @@ class TestMatcherParse:
     def test_raises_on_unclosed_angle_bracket(self) -> None:
         with pytest.raises(ValueError, match="Unclosed '<'"):
             Matcher("<int")
-
-    def test_raises_on_unclosed_square_bracket(self) -> None:
-        with pytest.raises(ValueError, match="Unclosed '\\['"):
-            Matcher("<[abc>")
 
     def test_raises_on_bad_multiplier(self) -> None:
         with pytest.raises(ValueError):
@@ -534,32 +536,30 @@ class TestMatcherMultiplier:
 # ══════════════════════════════════════════════
 
 class TestMatcherCharGroup:
-    def test_explicit_group_match(self) -> None:
-        assert Matcher("<[aeiou]>").match("hello")  is True
-        assert Matcher("<[aeiou]>").match("rhythm") is False
-
     def test_range_lowercase(self) -> None:
-        assert Matcher("<[a-z]>").match("Hello") is True
-        assert Matcher("<[a-z]>").match("123")   is False
+        assert Matcher("<a-z>").match("Hello") is True   # 'e' in range
+        assert Matcher("<a-z>").match("123")   is False
+
+    def test_range_uppercase(self) -> None:
+        assert Matcher("<A-Z>").match("Hello") is True   # 'H' in range
+        assert Matcher("<A-Z>").match("hello") is False
 
     def test_range_digits(self) -> None:
-        assert Matcher("<[0-9]>").match("abc5") is True
-        assert Matcher("<[0-9]>").match("abcd") is False
+        assert Matcher("<0-9>").match("abc5") is True
+        assert Matcher("<0-9>").match("abcd") is False
 
-    def test_mixed_range_and_explicit(self) -> None:
-        assert Matcher("<[a-z0-9]>").match("Hello5") is True
-        assert Matcher("<[a-z0-9]>").match("HELLO")  is False
+    def test_range_with_multiplier(self) -> None:
+        """<a-z*3> should match exactly 3 lowercase letters."""
+        assert Matcher("<a-z*3>").match("abcDEF") is True
+        assert Matcher("<a-z*3>").match("abDEF")  is False
 
-    def test_char_group_with_multiplier(self) -> None:
-        assert Matcher("<[a-z]*3>").match("abcDEF") is True
-        assert Matcher("<[a-z]*3>").match("abDEF")  is False
-
-    def test_char_group_in_complex_pattern(self) -> None:
-        # "Ab12" → 'A' ✅, 'b' ✅ (1st lowercase), '1' ❌ (needs 2nd lowercase)
-        # needs TWO lowercase letters → "Abc1" is the correct match
-        assert Matcher("<[A-Z]><[a-z]*2><int>").match("Ab12") is False
-        assert Matcher("<[A-Z]><[a-z]*2><int>").match("Abc1") is True
-        assert Matcher("<[A-Z]><[a-z]*2><int>").match("ab12") is False  # no uppercase
+    def test_range_in_complex_pattern(self) -> None:
+        # 'A' uppercase ✅, 'b' lowercase ✅, 'c' lowercase ✅, '1' digit ✅
+        assert Matcher("<A-Z><a-z*2><0-9>").match("Abc1") is True
+        # 'A' ✅, 'b' ✅ (only 1 lowercase), '1' fails <a-z> ❌
+        assert Matcher("<A-Z><a-z*2><0-9>").match("Ab12") is False
+        # 'a' fails <A-Z> ❌
+        assert Matcher("<A-Z><a-z*2><0-9>").match("abc1") is False
 
 
 # ══════════════════════════════════════════════
@@ -582,10 +582,10 @@ class TestMatcherMixed:
         assert Matcher("<int*3>").match("no numbers here at all") is False
 
     def test_complex_all_features(self) -> None:
-        """'<[A-Z]><[a-z]*4><space><int*2>' matches e.g. 'Hello 42'"""
-        assert Matcher("<[A-Z]><[a-z]*4><space><int*2>").match("Hello 42") is True
-        assert Matcher("<[A-Z]><[a-z]*4><space><int*2>").match("hello 42") is False
-        assert Matcher("<[A-Z]><[a-z]*4><space><int*2>").match("Hello 4")  is False
+        """'<A-Z><a-z*4><space><0-9*2>' matches e.g. 'Hello 42'"""
+        assert Matcher("<A-Z><a-z*4><space><0-9*2>").match("Hello 42") is True
+        assert Matcher("<A-Z><a-z*4><space><0-9*2>").match("hello 42") is False
+        assert Matcher("<A-Z><a-z*4><space><0-9*2>").match("Hello 4")  is False
 
 
 # ══════════════════════════════════════════════
@@ -594,62 +594,49 @@ class TestMatcherMixed:
 
 class TestMatcherLiteralQuoting:
     """
-    Tests for the <<...>> literal quoting syntax.
+    Tests for the <<X>> syntax — always matches the literal text <X>.
 
-    <<...>> tells the parser: "treat every character inside as a plain
-    literal — do NOT interpret it as a token."
-
-    This solves the problem of writing characters like '<' in a pattern
-    without the parser thinking a token is starting.
+    <<int>>  →  matches "<int>"    (not interpreted as digit token)
+    <<a-z>>  →  matches "<a-z>"   (not interpreted as range token)
+    <<a:z>>  →  matches "<a:z>"   (arbitrary content wrapped in < >)
+    <<>>     →  matches "<>"      (empty content → just angle brackets)
     """
 
-    def test_quoted_word_matches(self) -> None:
-        """<<hello>> should match the literal text 'hello'."""
-        assert Matcher("<<hello>>").match("say hello there") is True
+    def test_quoted_token_name_matches_angle_bracketed_text(self) -> None:
+        """<<int>> should match the literal text '<int>', not a digit."""
+        assert Matcher("<<int>>").match("type <int> here") is True
+        assert Matcher("<<int>>").match("type int here")   is False
+        assert Matcher("<<int>>").match("123")             is False
 
-    def test_quoted_word_no_match(self) -> None:
-        """<<hello>> should NOT match text without 'hello'."""
-        assert Matcher("<<hello>>").match("say goodbye") is False
+    def test_quoted_range_matches_angle_bracketed_range(self) -> None:
+        """<<a-z>> should match the literal text '<a-z>'."""
+        assert Matcher("<<a-z>>").match("range <a-z> here") is True
+        assert Matcher("<<a-z>>").match("range a-z here")   is False
 
-    def test_quoted_angle_bracket(self) -> None:
-        """<<<>> should match a literal '<' character."""
-        assert Matcher("<<<>>").match("a<b") is True
-        assert Matcher("<<<>>").match("abc") is False
+    def test_quoted_arbitrary_content(self) -> None:
+        """<<a:z>> should match the literal text '<a:z>'."""
+        assert Matcher("<<a:z>>").match("token <a:z> here") is True
+        assert Matcher("<<a:z>>").match("token a:z here")   is False
 
-    def test_quoted_token_name_is_literal(self) -> None:
-        """<<int>> should match the literal text 'int', NOT a digit."""
-        assert Matcher("<<int>>").match("int value") is True
-        assert Matcher("<<int>>").match("123")       is False
-
-    def test_quoted_space_is_literal_space(self) -> None:
-        """<<space>> should match the literal word 'space', not whitespace."""
-        assert Matcher("<<space>>").match("outer space") is True
-        assert Matcher("<<space>>").match("hello world") is False
-
-    def test_empty_quote_is_noop(self) -> None:
-        """
-        <<>> is an empty quote — adds zero patterns to the list.
-
-        With zero patterns, the for..else loop in match() completes
-        immediately (no patterns to fail), so it returns True for any
-        non-empty string. An empty string never enters the sliding window
-        loop at all (range(0) is empty), so it returns False.
-        """
-        assert Matcher("<<>>").match("anything") is True   # loop runs, 0 patterns → True
-        assert Matcher("<<>>").match("")          is False  # range(0) never runs → False
+    def test_empty_quote_matches_angle_brackets(self) -> None:
+        """<<>> should match the literal text '<>'."""
+        assert Matcher("<<>>").match("empty <> brackets") is True
+        assert Matcher("<<>>").match("no brackets here")  is False
 
     def test_quote_mixed_with_tokens(self) -> None:
         """Mixing <<...>> with real tokens should work correctly."""
-        # Pattern: literal 'val=' then a digit
-        assert Matcher("<<val=>><int>").match("val=5") is True
-        assert Matcher("<<val=>><int>").match("val=x") is False
+        # Pattern: literal '<int>' then an actual digit
+        assert Matcher("<<int>><int>").match("<int>5") is True
+        assert Matcher("<<int>><int>").match("<int>x") is False
+        assert Matcher("<<int>><int>").match("int>5")  is False
 
-    def test_quote_mixed_with_literals(self) -> None:
-        """<<...>> next to plain literal chars should all parse correctly."""
-        # "a<<bc>>d" → Literal(a), Literal(b), Literal(c), Literal(d)
-        # effectively same as matching "abcd"
-        assert Matcher("a<<bc>>d").match("abcd") is True
-        assert Matcher("a<<bc>>d").match("axcd") is False
+    def test_quote_mixed_with_plain_literals(self) -> None:
+        """<<...>> next to plain literal chars should parse correctly."""
+        # "a<<bc>>d" → Literal('a'), Literal('<'), Literal('b'),
+        #              Literal('c'), Literal('>'), Literal('d')
+        # matches "a<bc>d"
+        assert Matcher("a<<bc>>d").match("a<bc>d") is True
+        assert Matcher("a<<bc>>d").match("abcd")   is False
 
     def test_unclosed_quote_raises(self) -> None:
         """<<hello without closing >> should raise ValueError."""
